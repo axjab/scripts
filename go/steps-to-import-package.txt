@@ -1,7 +1,0 @@
-All files belonging to the same package must belong in a common directory
-
-go.mod is required at top level for 'import' to work
-
-to make functions PUBLIC a.k.a EXPORTABLE, must begin with uppercase letter
-
-lowercase functions are private by design
