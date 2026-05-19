@@ -1,8 +1,0 @@
-#!/bin/bash
-
-GUM_CHOOSE_LABEL_DELIMITER=":"
-GUM_CHOOSE_INPUT_DELIMITER=","
-LIST="git add files:git add .,add a journal entry:jrnl -w,add a task:td add,add a transaction:coin add"
-
-cmd=$(echo $LIST | gum choose)
-echo $cmd

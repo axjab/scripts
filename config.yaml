@@ -1,9 +1,0 @@
-bars:
-  - name: hunger
-    value: 75
-    max: 100
-    color: green
-  - name: hydration
-    value: 50
-    max: 100
-    color: blue

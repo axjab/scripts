@@ -1,1 +1,0 @@
-/home/ahmad/src/xq/xq.sh

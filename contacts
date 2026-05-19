@@ -1,7 +1,0 @@
-#!/bin/bash
-
-CONTACTS_LIST="$NEXUS/misc/contacts.yml"
-
-echo -e "Contacts list: $CONTACTS_LIST\n"
-
-cat "$CONTACTS_LIST"
