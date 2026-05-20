@@ -1,52 +1,11 @@
 #!/bin/bash
-set -euo pipefail
 
-# Taskdog CLI wrapper - connects to Firelink server via Tailscale
-# Usage: td <command> [args...]
-# Examples:
-#   td table
-#   td add "Review PR" --priority 10
-#   td start 42
+# td — taskdog wrapper
+# Default behaviour: launch tui
+# Usage: td [command] [args...]
 
-# Config validation
-TASKDOG_HOST="${TASKDOG_HOST:-}"
-TASKDOG_PORT="${TASKDOG_PORT:-}"
-TASKDOG_API_KEY="${TASKDOG_API_KEY:-}"
-
-if [[ -z "$TASKDOG_HOST" ]]; then
-  echo "Error: TASKDOG_HOST not set" >&2
-  echo "Export it in your shell profile:" >&2
-  echo "  export TASKDOG_HOST=taskdog.z" >&2
-  exit 1
+if [[ $# -eq 0 ]]; then
+  EDITOR=micro exec taskdog tui
 fi
 
-if [[ -z "$TASKDOG_PORT" ]]; then
-  echo "Error: TASKDOG_PORT not set" >&2
-  echo "Export it in your shell profile:" >&2
-  echo "  export TASKDOG_PORT=443" >&2
-  exit 1
-fi
-
-# Connection check on first invocation per shell session
-if [[ -z "${TASKDOG_CHECKED:-}" ]]; then
-  if ! curl -sf -m 2 "https://$TASKDOG_HOST/health" >/dev/null 2>&1; then
-    echo "Warning: Cannot reach server at https://$TASKDOG_HOST/health" >&2
-    echo "Check that:" >&2
-    echo "  - Tailscale is connected" >&2
-    echo "  - taskdog-server container is running on Firelink" >&2
-    echo "  - Caddy is forwarding taskdog.z correctly" >&2
-    echo "" >&2
-  fi
-  export TASKDOG_CHECKED=1
-fi
-
-# Build taskdog command
-CMD=(taskdog --host "$TASKDOG_HOST" --port "$TASKDOG_PORT")
-
-# Add API key only if set (for system/automation contexts)
-if [[ -n "$TASKDOG_API_KEY" ]]; then
-  CMD+=(--api-key "$TASKDOG_API_KEY")
-fi
-
-# Pass through to taskdog CLI
-exec "${CMD[@]}" "$@"
+EDITOR=micro exec taskdog "$@"
