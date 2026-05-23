@@ -102,7 +102,7 @@ for TARGET in "${TARGETS[@]}"; do
     else
 
         # plain file → straight claim with confirmation
-        gum confirm "Claim '$ABS' from '$OWNER'?" \
+        gum confirm "Claim file '$ABS' as $(whoami)?" \
             || { info "Skipped '$ABS'."; continue; }
 
         sudo chown -v "$CURRENT_USER:$CURRENT_GROUP" "$ABS" \
