@@ -1,51 +1,11 @@
 #!/bin/bash
 
-# jot - Write something
-# jot ? Query something
-# jot / Execute something
-# jot   Do something
-# CTRL+C must interrupt gum
-
-ARGS="$@"
-STOP=0
-RED_COLOR='' #todo
-NEUTRAL='' #todo
-
-main() {
-  
-  case $1 in
-    '-' | '--') jrnl_write "${@:2}" ; STOP=1 ;;
-    '/') jrnl_query "${@:2}" ; STOP=1 ;;
-  esac
-
-  exit=$?
-
-  if [[ $STOP -eq 1 ]]; then echo "STOP $exit" ; exit $exit; fi
-
-  case $(confirm_action "$ARGS") in
-    'W') main - $ARGS ;;
-    'Q') main / $ARGS ;;
-  esac
-}
-
-jrnl_write() {
-  echo "write"
-  j -w $@
-}
-
-jrnl_query() {
-  echo "query"
-  j $@
-}
-
-confirm_action() {
-  gum choose\
-    --label-delimiter="||"\
-    --header="Confirm action:"\
-    "Write <$@> to jrnl||W"\
-    "Query <$@>||Q"
-  if [[ $? -eq 130 ]]; then >&2 echo "${RED_COLOR}INTERRUPTED${NEUTRAL} (code 130)"; fi
-  return 130
-}
-
-main $ARGS
+cat <<EOF
+1. WRITE SOMETHING
+2. SAVE AS NEW BY DEFAULT
+3. UPDATE OR CREATE NEW JOT?
+4. MERGE 2 NOTES: open a terminal with both texts in order of args
+5. SEARCH TITLES
+6. GREP, CAT, AND MORE
+7. HOLY SHIT WE COOKING
+EOF

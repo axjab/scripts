@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# td — taskdog wrapper
+# Default behaviour: launch tui
+# Usage: td [command] [args...]
+
+if [[ $# -eq 0 ]]; then
+  EDITOR=micro exec taskdog tui
+fi
+
+EDITOR=micro exec taskdog "$@"

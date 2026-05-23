@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+
+tmp="$(mktemp -t "yazi-cwd.XXXXXX")"
+
+cleanup() {
+    rm -f -- "$tmp"
+}
+
+trap cleanup EXIT
+
+yazi "$@" --cwd-file="$tmp"
+
+IFS= read -r -d '' cwd < "$tmp"
+
+# if [ "$cwd" != "$PWD" ] && [ -d "$cwd" ]; then
+#     printf '%s\n' "$cwd"
+# fi
+
+cd "$cwd"
