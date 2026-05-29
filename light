@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# 🖥️  Display Brightness Controller
+#     Interactive DDC/CI brightness control powered by ddcutil + gum
+# =============================================================================
+
+# --- Dependency Checks -------------------------------------------------------
+for cmd in gum ddcutil; do
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "ERROR: '$cmd' is not installed. Please install it first." >&2
+    exit 1
+  fi
+done
+
+# --- Dracula Color Palette ---------------------------------------------------
+PINK="#FF79C6"
+CYAN="#8BE9FD"
+GREEN="#50FA7B"
+YELLOW="#F1FA8C"
+PURPLE="#BD93F9"
+RED="#FF5555"
+COMMENT="#6272A4"
+FG="#F8F8F2"
+
+# --- Header ------------------------------------------------------------------
+clear
+gum style \
+  --border double \
+  --margin "1" \
+  --padding "1 4" \
+  --align center \
+  --foreground "$PINK" \
+  "🖥️  Display Brightness Controller" \
+  "" \
+  "$(gum style --foreground "$CYAN" "ddcutil") $(gum style --foreground "$FG" "+") $(gum style --foreground "$GREEN" "gum")"
+
+# --- Detect Displays ---------------------------------------------------------
+gum style --foreground "$COMMENT" --margin "0 1" "🔍 Detecting DDC/CI capable displays..."
+
+DISPLAYS=$(sudo ddcutil detect --brief 2>/dev/null | grep -E '^Display [0-9]+' | sed 's/://' || true)
+
+if [ -z "$DISPLAYS" ]; then
+  gum style --foreground "$YELLOW" --margin "1" "⚠️  Auto-detection failed (maybe sudo needs a password?)."
+  gum style --foreground "$COMMENT" --margin "0 1" "Falling back to manual display list..."
+  DISPLAYS="Display 1
+Display 2"
+fi
+
+# Prepend "All displays" option
+DISPLAYS="All displays
+${DISPLAYS}"
+
+# --- Select Display ----------------------------------------------------------
+SELECTED=$(printf "%s\n" "$DISPLAYS" | gum choose \
+  --header "$(gum style --foreground "$FG" "Select target display:")" \
+  --cursor.foreground "$PINK")
+
+if [ -z "$SELECTED" ]; then
+  gum style --foreground "$RED" --margin "1" "No display selected. Exiting."
+  exit 1
+fi
+
+# --- Resolve Target Display Numbers ------------------------------------------
+if [ "$SELECTED" = "All displays" ]; then
+  TARGETS=$(printf "%s\n" "$DISPLAYS" | grep -E '^Display [0-9]+' | grep -oE '[0-9]+')
+else
+  TARGETS=$(echo "$SELECTED" | grep -oE '[0-9]+')
+fi
+
+# --- Read Current Brightness -------------------------------------------------
+FIRST_TARGET=$(echo "$TARGETS" | head -n1)
+CURRENT_VAL=$(sudo ddcutil --display "$FIRST_TARGET" getvcp 10 2>/dev/null \
+  | sed -n 's/.*current value = \([0-9]*\).*/\1/p' || true)
+
+if [ -z "$CURRENT_VAL" ]; then
+  CURRENT_VAL="50"
+fi
+
+# --- Input New Brightness ----------------------------------------------------
+gum style --margin "1 0" --foreground "$PURPLE" \
+  "Current brightness: $(gum style --bold --foreground "$YELLOW" "${CURRENT_VAL}%")"
+
+NEW_VAL=$(gum input \
+  --placeholder "Enter a value between 0 and 100" \
+  --prompt "$(gum style --foreground "$GREEN" "➜ New brightness: ")" \
+  --value "$CURRENT_VAL" \
+  --width 30)
+
+# --- Validate Input ----------------------------------------------------------
+if ! [[ "$NEW_VAL" =~ ^[0-9]+$ ]] || [ "$NEW_VAL" -lt 0 ] || [ "$NEW_VAL" -gt 100 ]; then
+  gum style --foreground "$RED" --margin "1" "❌ Invalid input: '$NEW_VAL'. Must be an integer between 0 and 100."
+  exit 1
+fi
+
+# --- Confirmation ------------------------------------------------------------
+if ! gum confirm \
+  --affirmative "Apply ${NEW_VAL}%" \
+  --negative "Cancel" \
+  "Set brightness to ${NEW_VAL}%?"; then
+  gum style --foreground "$COMMENT" "Cancelled."
+  exit 0
+fi
+
+# --- Apply Brightness --------------------------------------------------------
+FAILED=0
+while IFS= read -r num; do
+  [ -z "$num" ] && continue
+
+  if ! gum spin \
+    --spinner pulse \
+    --title "$(gum style --foreground "$CYAN" "Updating Display $num → ${NEW_VAL}%...")" \
+    --show-output \
+    -- sudo ddcutil --display "$num" setvcp 10 "$NEW_VAL"; then
+
+    gum style --foreground "$RED" "❌ Failed to update Display $num."
+    FAILED=$((FAILED + 1))
+  fi
+done <<< "$TARGETS"
+
+# --- Success / Failure Summary -----------------------------------------------
+if [ "$FAILED" -eq 0 ]; then
+  gum style \
+    --border rounded \
+    --margin "1" \
+    --padding "1 4" \
+    --align center \
+    --foreground "$GREEN" \
+    "✨ Brightness updated successfully!" \
+    "" \
+    "$(gum style --foreground "$FG" "All selected displays are now at ")$(gum style --bold --foreground "$PINK" "${NEW_VAL}%")"
+else
+  gum style --foreground "$YELLOW" --margin "1" "⚠️  $FAILED display(s) could not be updated."
+fi
