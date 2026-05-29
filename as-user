@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+
+# 1. Interactive mode if no arguments are provided
+if [ $# -eq 0 ]; then
+    if ! command -v gum &> /dev/null; then
+        echo "Error: 'gum' is not installed." >&2
+        exit 1
+    fi
+    
+    # Launch a minimal gum input prompt.
+    # --prompt "as " creates the illusion you are continuing the command on the same line.
+    INPUT=$(gum input --prompt "as " --placeholder "user [do] command..." --width 0)
+    
+    # Exit gracefully if the user cancels (Ctrl+C / Esc) or submits empty
+    [ -z "$INPUT" ] && exit 0
+    
+    # Print the command back to the terminal in a dim color so it stays in your scrollback
+    echo -e "\033[2mas $INPUT\033[0m"
+    
+    # Parse the input string into positional parameters, respecting quotes
+    eval "set -- $INPUT"
+fi
+
+# 2. Extract the target user
+TARGET_USER="$1"
+shift
+
+# 3. Strip the optional "do" keyword if it's the next argument
+if [ "$1" = "do" ]; then
+    shift
+fi
+
+# 4. Ensure a command was actually provided
+if [ $# -eq 0 ]; then
+    echo "Error: No command specified to run as $TARGET_USER." >&2
+    exit 1
+fi
+
+# 5. Execute the command
+# 'exec' replaces the current script process with the sudo process
+exec sudo -u "$TARGET_USER" "$@"
