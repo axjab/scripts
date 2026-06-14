@@ -1,7 +1,0 @@
-#!/bin/bash
-
-# execute command
-eval $@
-
-# invert exit result
-[[ $? -gt 0 ]]

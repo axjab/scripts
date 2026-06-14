@@ -1,6 +1,0 @@
-#!/bin/bash
-
-# Tells the xfce window manager to stop fucking trippin (flickering)
-xfwm4 --replace &
-sleep 0.5
-echo -e "\n"
