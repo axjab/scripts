@@ -2,3 +2,4 @@
 pkg/
 dist/
 qb
+/bin/auth
