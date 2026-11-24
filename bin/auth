@@ -1,0 +1,538 @@
+#!/usr/bin/python3
+"""Local YubiKey authenticator; no credential storage or background process."""
+import argparse
+import base64
+import contextlib
+import getpass
+import math
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import unicodedata
+import warnings
+
+VERSION = "0.1.0"
+POLICY = {
+    "Yubico OTP": "Disabled", "FIDO U2F": "Disabled",
+    "FIDO2": "Enabled", "OATH": "Enabled", "PIV": "Disabled",
+    "OpenPGP": "Enabled", "YubiHSM Auth": "Disabled",
+}
+READ_COMMANDS = {
+    ("--version",), ("list", "--serials"), ("info",),
+    ("fido", "credentials", "list"), ("openpgp", "info"),
+    ("openpgp", "keys", "info", "--help"),
+    ("openpgp", "keys", "info", "sig"),
+    ("openpgp", "keys", "info", "enc"),
+    ("openpgp", "keys", "info", "dec"),
+    ("openpgp", "keys", "info", "aut"),
+}
+
+
+class AuthError(Exception):
+    pass
+
+
+def safe(value):
+    """Do not let hardware-controlled strings inject terminal controls."""
+    return "".join(c if c.isprintable() else "?" for c in str(value))
+
+
+def backend(args, serial=None, interactive=False):
+    if tuple(args) not in READ_COMMANDS:
+        raise AuthError("Backend command not permitted")
+    if not shutil.which("ykman"):
+        raise AuthError("ykman is not installed")
+    cmd = ["ykman"]
+    if serial is not None:
+        cmd += ["--device", str(serial)]
+    cmd += list(args)
+    try:
+        result = subprocess.run(
+            cmd, text=True, check=False,
+            stdin=None if interactive else subprocess.DEVNULL,
+            stdout=None if interactive else subprocess.PIPE,
+            stderr=None if interactive else subprocess.PIPE,
+            timeout=None if interactive else 15,
+        )
+    except subprocess.TimeoutExpired:
+        raise AuthError("ykman timed out") from None
+    if result.returncode:
+        detail = (result.stderr or "").lower()
+        reason = ("permission denied" if "permission" in detail else
+                  "device not found" if "not found" in detail else
+                  "unsupported command or application" if "not supported" in detail
+                  or "no such command" in detail else "backend failed")
+        raise AuthError("ykman " + " ".join(args) + ": " + reason)
+    return result.stdout or ""
+
+
+def serials():
+    result = backend(("list", "--serials"))
+    lines = result.splitlines()
+    if any(not re.fullmatch(r"\d+", line.strip()) for line in lines):
+        raise AuthError("Unrecognized device inventory")
+    return list(dict.fromkeys(line.strip() for line in lines))
+
+
+def select_serial(requested, explicit=False):
+    devices = serials()
+    if requested:
+        if requested not in devices:
+            raise AuthError("Selected YubiKey not detected")
+        return requested
+    if not devices:
+        raise AuthError("No serial-numbered YubiKey detected; check USB access")
+    if len(devices) != 1 or explicit:
+        raise AuthError("Select a YubiKey explicitly with --device SERIAL")
+    return devices[0]
+
+
+def terminal():
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def secret(prompt):
+    if not terminal():
+        raise AuthError("Secure input requires an interactive terminal")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", getpass.GetPassWarning)
+        try:
+            return getpass.getpass(prompt)
+        except getpass.GetPassWarning:
+            raise AuthError("Cannot disable terminal echo") from None
+
+
+@contextlib.contextmanager
+def oath_session(serial):
+    # Use the installed Yubico SDK for OATH only: CLI code can trigger a
+    # lone HOTP credential or automatically delete a corrupted credential.
+    try:
+        from ykman.device import list_all_devices
+        from yubikit.core.smartcard import SmartCardConnection
+        from yubikit.oath import OathSession
+    except ImportError:
+        raise AuthError("Install ykman and its Python SDK for system Python") from None
+    matches = [dev for dev, info in list_all_devices([SmartCardConnection])
+               if str(info.serial) == serial]
+    if len(matches) != 1:
+        raise AuthError("Selected YubiKey CCID access unavailable or ambiguous")
+    with matches[0].open_connection(SmartCardConnection) as connection:
+        session = OathSession(connection)
+        if session.locked:
+            session.validate(session.derive_key(secret("OATH password: ")))
+        yield session
+
+
+def account_id(cred):
+    return cred.id.decode("utf-8")
+
+
+def resolve(accounts, query):
+    matches = [c for c in accounts if query.casefold() in account_id(c).casefold()]
+    if not query or not matches:
+        raise AuthError("No matching OATH account")
+    if len(matches) != 1:
+        raise AuthError("Ambiguous OATH query; use a more specific fragment")
+    return matches[0]
+
+
+def visible_accounts(session):
+    return sorted(c for c in session.list_credentials() if c.issuer != "_hidden")
+
+
+def is_hotp(cred):
+    return cred.oath_type.name == "HOTP"
+
+
+def fetch_codes(session, timestamp, target=None):
+    # calculate_all explicitly excludes HOTP and touch-required credentials.
+    # No CLI repair fallback, no implicit calculate_code on a lone HOTP.
+    entries = session.calculate_all(timestamp)
+    if target is not None:
+        entries = {c: code for c, code in entries.items() if c.id == target}
+        if len(entries) != 1:
+            raise AuthError("Selected OATH account disappeared")
+    rows = []
+    for cred, code in sorted(entries.items()):
+        if cred.issuer == "_hidden":
+            continue
+        if is_hotp(cred):
+            rows.append((account_id(cred), "HOTP - on demand only", None, None))
+        elif cred.touch_required:
+            rows.append((account_id(cred), "Touch required", None, None))
+        elif code is not None and cred.period > 0:
+            if cred.issuer == "Steam":
+                from ykman.oath import calculate_steam
+                if cred.period != 30:
+                    raise AuthError("Unsupported Steam credential period")
+                value = calculate_steam(session, cred, timestamp)
+            else:
+                value = code.value
+            rows.append((account_id(cred), value, code.valid_from, code.valid_to))
+        else:
+            rows.append((account_id(cred), "Unavailable", None, None))
+    return rows
+
+
+def valid(row, now):
+    return row[2] is not None and row[2] <= now < row[3]
+
+
+def needs_refresh(rows, now):
+    return any(row[2] is not None and not valid(row, now) for row in rows)
+
+
+def render(rows, now):
+    lines = ["ACCOUNT / CODE / EXPIRES"]
+    for name, value, start, end in rows:
+        if start is None:
+            status = value
+        elif valid((name, value, start, end), now):
+            seconds = math.ceil(end - now)
+            fraction = min(10, math.ceil(10 * seconds / (end - start)))
+            status = f"{value}  {seconds}s [{'#' * fraction}{'.' * (10 - fraction)}]"
+        else:
+            status = "Expired - refreshing"
+        lines.append(f"{safe(name)}  {safe(status)}")
+    if not rows:
+        lines.append("No visible OATH accounts")
+    return lines
+
+
+def fit(line, width):
+    """Conservatively reserve two columns for every non-ASCII character."""
+    result = []
+    remaining = max(0, width - 1)
+    for char in safe(line):
+        size = 1 if char.isascii() else 2
+        if remaining < size:
+            break
+        result.append(char)
+        remaining -= size
+    return "".join(result)
+
+
+def watch(session, query):
+    target = resolve(visible_accounts(session), query).id if query else None
+    live = terminal() and os.environ.get("TERM", "dumb") != "dumb"
+    old_count = 0
+    dimensions = shutil.get_terminal_size()
+    try:
+        rows = fetch_codes(session, int(time.time()), target)
+        if target is not None and len(rows) == 1 and rows[0][1] == "Touch required":
+            if not live:
+                raise AuthError("Touch credential requires an interactive terminal")
+            # Re-read metadata before the explicit touch operation; never HOTP.
+            matches = [c for c in session.list_credentials() if c.id == target]
+            if len(matches) != 1 or is_hotp(matches[0]):
+                raise AuthError("Selected credential changed")
+            cred = matches[0]
+            print("Touch your YubiKey (one code only).", file=sys.stderr)
+            code = session.calculate_code(cred)
+            value = code.value
+            if cred.issuer == "Steam":
+                raise AuthError("Touch-required Steam credentials are not supported")
+            rows = [(account_id(cred), value, code.valid_from, code.valid_to)]
+            live = False
+        if not live:
+            if needs_refresh(rows, time.time()):
+                rows = fetch_codes(session, int(time.time()), target)
+            print("\n".join(render(rows, time.time())))
+            return
+        while True:
+            now = time.time()
+            if needs_refresh(rows, now):
+                # Invalidate old codes on screen before potentially slow I/O.
+                expired = render(rows, now)
+                draw(expired, old_count, dimensions.columns)
+                old_count = len(expired)
+                rows = fetch_codes(session, int(time.time()), target)
+                now = time.time()
+            lines = render(rows, now)
+            if (shutil.get_terminal_size() != dimensions
+                    or len(lines) >= dimensions.lines
+                    or (old_count and old_count != len(lines))):
+                # Resizing/reflow makes previous cursor coordinates unreliable.
+                print("Watch stopped: terminal size or account count changed.")
+                return
+            draw(lines, old_count, dimensions.columns)
+            old_count = len(lines)
+            if not any(row[2] is not None for row in rows):
+                return
+            next_end = min(row[3] for row in rows if row[3] is not None)
+            time.sleep(max(0.05, min(1.0, next_end - time.time())))
+    finally:
+        # No alternate screen, cursor hiding or terminal-wide erase is used.
+        sys.stdout.flush()
+
+
+def draw(lines, previous, width):
+    if previous:
+        sys.stdout.write(f"\x1b[{previous}A")
+    for line in lines:
+        sys.stdout.write("\r\x1b[2K" + fit(line, width) + "\n")
+    sys.stdout.flush()
+
+
+def confirm(message):
+    if not terminal():
+        raise AuthError("Hardware writes require an interactive terminal")
+    print(message, file=sys.stderr)
+    return input("Proceed? [y/N] ").strip().lower() == "y"
+
+
+def name_parts(value, default_issuer=None):
+    issuer, name = value.split(":", 1) if ":" in value else (default_issuer, value)
+    if not name or any(not c.isprintable() for c in value) or issuer == "_hidden":
+        raise AuthError("Invalid account name or issuer")
+    return issuer or None, name
+
+
+def write_oath(session, serial, command, args, options):
+    from yubikit.oath import CredentialData, OATH_TYPE, HASH_ALGORITHM
+    accounts = session.list_credentials()
+    if command == "add":
+        if not terminal():
+            raise AuthError("Enrollment requires an interactive terminal")
+        value = args[0] if args else input("Account name: ").strip()
+        issuer, name = name_parts(value)
+        if issuer is None:
+            issuer = input("Issuer (optional): ").strip() or None
+            if issuer and (":" in issuer or issuer == "_hidden"
+                           or any(not c.isprintable() for c in issuer)):
+                raise AuthError("Invalid issuer")
+        kind = OATH_TYPE[options.oath_type]
+        if options.counter and kind != OATH_TYPE.HOTP:
+            raise AuthError("Counter is only valid for HOTP")
+        if kind == OATH_TYPE.HOTP and options.period != 30:
+            raise AuthError("Period is only valid for TOTP")
+        data = CredentialData(name, kind, HASH_ALGORITHM[options.algorithm],
+                              b"", options.digits, options.period,
+                              options.counter, issuer)
+        if any(c.id == data.get_id() for c in accounts):
+            raise AuthError("Account already exists; refusing overwrite")
+        if not confirm(f"Persistently enroll {safe(data.get_id().decode())} on YubiKey {serial}; no touch required. Can be removed later."):
+            raise AuthError("Enrollment cancelled")
+        try:
+            raw = secret("Base32 secret: ").upper().replace(" ", "")
+            data.secret = base64.b32decode(raw + "=" * (-len(raw) % 8))
+            if len(data.secret) < 2:
+                raise ValueError()
+        except (ValueError, TypeError):
+            raise AuthError("Invalid Base32 secret") from None
+        if any(c.id == data.get_id() for c in session.list_credentials()):
+            raise AuthError("Account appeared; refusing overwrite")
+        session.put_credential(data, touch_required=False)
+        if not any(c.id == data.get_id() for c in session.list_credentials()):
+            raise AuthError("Enrollment not verified")
+        print("Enrolled.")
+        return
+    cred = resolve(accounts, args[0])
+    if command == "rename":
+        issuer, name = name_parts(args[1], cred.issuer)
+        if session.version < (5, 3, 1):
+            raise AuthError("Rename requires firmware 5.3.1 or later")
+        data = CredentialData(name, cred.oath_type, HASH_ALGORITHM.SHA1,
+                              b"", period=cred.period, issuer=issuer)
+        if any(c.id == data.get_id() for c in accounts):
+            raise AuthError("Destination account already exists")
+        if not confirm(f"Persistently rename {safe(account_id(cred))} on YubiKey {serial} to {safe(data.get_id().decode())}. Reversible by renaming again."):
+            raise AuthError("Rename cancelled")
+        if any(c.id == data.get_id() for c in session.list_credentials()):
+            raise AuthError("Destination appeared; refusing overwrite")
+        new_id = session.rename_credential(cred.id, name, issuer)
+        remaining = {c.id for c in session.list_credentials()}
+        if new_id != data.get_id() or new_id not in remaining or cred.id in remaining:
+            raise AuthError("Rename not verified")
+        print("Renamed.")
+    else:
+        if not confirm(f"Permanently delete {safe(account_id(cred))} from YubiKey {serial}. Cannot recover without the original secret."):
+            raise AuthError("Deletion cancelled")
+        session.delete_credential(cred.id)
+        if any(c.id == cred.id for c in session.list_credentials()):
+            raise AuthError("Deletion not verified")
+        print("Deleted.")
+
+
+def compare_info(info):
+    """Return (check, status, observed, expected) records; never guess NFC."""
+    checks = []
+    fields = {}
+    apps = {}
+    columns = None
+    for line in info.splitlines():
+        match = re.fullmatch(r"\s*Applications\s*(USB)?\s*(NFC)?\s*", line)
+        if match:
+            columns = ("USB", "NFC") if match.group(2) and match.group(1) else ("USB",) if not match.group(2) else ("NFC",)
+            continue
+        if ":" in line:
+            key, value = line.split(":", 1)
+            fields[key.strip()] = value.strip()
+        for app in POLICY:
+            if columns and re.match(re.escape(app) + r"\s+", line.strip()):
+                tail = line.strip()[len(app):].strip()
+                values = re.findall(r"Not available|Not supported|Disabled|Enabled", tail, re.I)
+                if len(values) == len(columns) and " ".join(tail.split()).casefold() == " ".join(values).casefold():
+                    apps[app] = dict(zip(columns, values))
+    def check(label, actual, expected):
+        if actual is None:
+            status = "UNKNOWN"
+        elif actual.lower() in ("not available", "not supported"):
+            status = "UNSUPPORTED"
+        else:
+            status = "OK" if actual.casefold() == expected.casefold() else "MISMATCH"
+        checks.append((label, status, actual or "not reported", expected))
+    interfaces = fields.get("Enabled USB interfaces")
+    if interfaces is not None:
+        interfaces = ", ".join(sorted(x.strip() for x in interfaces.split(",")))
+    check("USB interfaces", interfaces, "CCID, FIDO")
+    nfc = re.search(r"(?im)^NFC transport is (enabled|disabled)\s*$", info)
+    check("NFC transport", nfc.group(1) if nfc else None, "enabled")
+    for app, expected in POLICY.items():
+        for transport in ("USB", "NFC"):
+            check(f"{app} / {transport}", apps.get(app, {}).get(transport), expected)
+    return checks
+
+
+def doctor(requested):
+    print("ENVIRONMENT")
+    print("  ykman             OK       " + safe(backend(("--version",)).strip()))
+    try:
+        clock = subprocess.run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
+                               capture_output=True, text=True, timeout=5)
+        synced = clock.stdout.strip() if clock.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        synced = ""
+    clock_status = "OK" if synced == "yes" else "MISMATCH" if synced == "no" else "UNKNOWN"
+    print(f"  Clock sync        {clock_status:12} {synced if synced in ('yes', 'no') else 'not reported'} (not proof of accuracy)")
+    devices = serials()
+    if requested:
+        if requested not in devices:
+            raise AuthError("Selected YubiKey not detected")
+        devices = [requested]
+    if not devices:
+        raise AuthError("No serial-numbered devices detected; check USB permissions")
+    result = 1 if clock_status == "MISMATCH" else 0
+    for serial in devices:
+        print(f"\nDEVICE {serial}")
+        try:
+            info = backend(("info",), serial)
+        except AuthError as exc:
+            print(f"  Device access     ERROR        {exc}; check USB/CCID permissions")
+            result = 2
+            continue
+        for line in info.splitlines():
+            if line.startswith(("Device type:", "Firmware version:", "Form factor:")):
+                print("  " + safe(line))
+        for label, status, actual, expected in compare_info(info):
+            print(f"  {label:24} {status:12} actual: {safe(actual)}; expected: {expected}")
+            if status != "OK":
+                result = max(result, 1 if status == "MISMATCH" else 2)
+    print("\nResult: " + ("Application policy verified." if result == 0 else
+                         "Review the observed/expected differences with ykman info; no changes made."))
+    return result
+
+
+def pgp(serial):
+    print(safe_multiline(backend(("openpgp", "info"), serial)))
+    help_text = backend(("openpgp", "keys", "info", "--help"), serial)
+    # Documented aliases vary; use advertised spelling, otherwise enc.
+    slot = "dec" if re.search(r"\bdec\b", help_text) and not re.search(r"\benc\b", help_text) else "enc"
+    result = 0
+    for key in ("sig", slot, "aut"):
+        print(f"\n{key.upper()}")
+        try:
+            output = backend(("openpgp", "keys", "info", key), serial)
+            print(safe_multiline(output) if output.strip() else "Metadata unavailable")
+            if not output.strip():
+                result = 2
+        except AuthError as exc:
+            print(f"Unknown/inaccessible: {exc}")
+            result = 2
+    return result
+
+
+def safe_multiline(value):
+    return "\n".join(safe(line) for line in value.splitlines())
+
+
+def parse(argv):
+    parser = argparse.ArgumentParser(description="YubiKey authenticator",
+        epilog="Commands: list (ls), add [name], rename QUERY NAME, rm (remove) QUERY, fido, pgp, doctor, help. No command watches TOTP; a query selects one account.")
+    parser.add_argument("--version", action="version", version=VERSION)
+    parser.add_argument("--device", metavar="SERIAL")
+    parser.add_argument("--algorithm", choices=("SHA1", "SHA256", "SHA512"), default="SHA1")
+    parser.add_argument("--digits", type=int, choices=(6, 7, 8), default=6)
+    parser.add_argument("--period", type=int, default=30)
+    parser.add_argument("--oath-type", choices=("TOTP", "HOTP"), default="TOTP")
+    parser.add_argument("--counter", type=int, default=0)
+    parser.add_argument("command", nargs="?")
+    parser.add_argument("args", nargs="*")
+    options = parser.parse_args(argv)
+    command = {"ls": "list", "remove": "rm"}.get(options.command, options.command)
+    if command == "help":
+        parser.print_help()
+        return None
+    if options.device and not re.fullmatch(r"\d+", options.device):
+        parser.error("device must be a serial number")
+    if not 1 <= options.period <= 86400 or not 0 <= options.counter <= 0xffffffff:
+        parser.error("invalid period or counter")
+    if command != "add" and (options.algorithm, options.digits, options.period,
+                             options.oath_type, options.counter) != ("SHA1", 6, 30, "TOTP", 0):
+        parser.error("enrollment options require add")
+    counts = {"list": (0,), "add": (0, 1), "rename": (2,), "rm": (1,),
+              "fido": (0,), "pgp": (0,), "doctor": (0,)}
+    if len(options.args) not in counts.get(command, (0,)):
+        parser.error("wrong number of arguments")
+    return command, options
+
+
+def main(argv=None):
+    try:
+        parsed = parse(argv)
+        if parsed is None:
+            return 0
+        command, options = parsed
+        if command == "doctor":
+            return doctor(options.device)
+        serial = select_serial(options.device)
+        if command == "fido":
+            if not terminal():
+                raise AuthError("FIDO inventory requires an interactive terminal for secure PIN input")
+            print("Discoverable credentials only; not all FIDO registrations. Incorrect PIN can reduce retries.", flush=True)
+            backend(("fido", "credentials", "list"), serial, interactive=True)
+            return 0
+        if command == "pgp":
+            return pgp(serial)
+        with oath_session(serial) as session:
+            if command == "list":
+                for cred in visible_accounts(session):
+                    print(safe(account_id(cred)), cred.oath_type.name, f"{cred.period}s" if not is_hotp(cred) else "", sep="\t")
+            elif command in ("add", "rename", "rm"):
+                write_oath(session, serial, command, options.args, options)
+            else:
+                watch(session, command)
+        return 0
+    except AuthError as exc:
+        print("auth: " + safe(exc), file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("\nauth: interrupted", file=sys.stderr)
+        return 130
+    except (EOFError, BrokenPipeError):
+        return 2
+    except Exception as exc:
+        # SDK errors may contain secret-bearing APDU data. Never echo them.
+        print(f"auth: device or backend error ({type(exc).__name__}); check connection and application access", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    def terminate(_signum, _frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, terminate)
+    sys.exit(main())
