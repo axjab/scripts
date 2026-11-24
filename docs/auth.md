@@ -29,7 +29,7 @@ The generated binary is intentionally not committed. Remove
 | Command | Behavior |
 | --- | --- |
 | auth | Watch TOTP, one global countdown, no terminal clear |
-| auth QUERY | One matching TOTP snapshot; explicit touch for a touch credential |
+| auth QUERY | Watch one matching TOTP; explicit touch is a one-shot |
 | auth list / ls | OATH names/types, no code generation |
 | auth add [issuer:name] | Persistent enrollment; no touch, SHA1/6 digits/30s defaults |
 | auth rename QUERY NAME | Persistent exact-ID rename, retains issuer/period |
@@ -59,8 +59,7 @@ nonstandard periods, the same single countdown reports the next expiration,
 and nonstandard entries are labeled with their period. Non-TTY stdout prints
 one snapshot and exits. HOTP is never calculated by this tool. Steam-format
 credentials are not supported in the native Go backend; the preserved Python
-implementation or Yubico Authenticator can be used deliberately. Explicit
-query is a one-shot in this draft. Resize, disconnect, or hardware error
+implementation or Yubico Authenticator can be used deliberately. An explicit touch-required query is a one-shot. Resize, disconnect, or hardware error
 requires restarting watch.
 
 ## Code map for a Go beginner

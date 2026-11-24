@@ -389,13 +389,13 @@ func watch(ctx context.Context,s oathSession,query string) error {
 	}
 	live:=interactive() && os.Getenv("TERM")!="" && os.Getenv("TERM")!="dumb"
 	now:=unixNow()
-	rows,err:=s.codes(accounts,selected,now,live && selected!="")
+	rows,err:=s.codes(accounts,selected,now,false)
 	if err!=nil { return err }
-	// A touch-required account is an explicit one-shot, never auto-prompt.
-	if selected!="" {
-		// Check whether the selected account's bulk result requires touch
-		// before starting a continuous watch. Conservatively make selected
-		// account views one-shot when using the explicit query.
+	// Only an explicit account query on a real terminal may trigger touch.
+	// Ordinary selected TOTP accounts use the same live view as the full list.
+	if selected!="" && len(rows)==1 && rows[0].Code=="Touch required" && live {
+		rows,err=s.codes(accounts,selected,unixNow(),true)
+		if err!=nil { return err }
 		live=false
 	}
 	if !live {
@@ -408,14 +408,16 @@ func watch(ctx context.Context,s oathSession,query string) error {
 	lines:=append(table(rows,unixNow()),countdown(rows,unixNow()))
 	if len(lines)>=height { return errors.New("terminal too short; enlarge or pipe to a snapshot") }
 	draw(os.Stdout,lines,0,width)
-	ticker:=time.NewTicker(time.Second)
-	defer ticker.Stop()
+	// Align updates to actual Unix seconds, not to the time auth started.
 	for {
 		end,timed:=nextExpiry(rows,unixNow())
 		if !timed { return nil }
+		delay:=time.Until(time.Unix(unixNow()+1,0))
+		if delay<0 { delay=0 }
+		timer:=time.NewTimer(delay)
 		select {
-		case <-ctx.Done(): return ctx.Err()
-		case <-ticker.C:
+		case <-ctx.Done(): timer.Stop(); return ctx.Err()
+		case <-timer.C:
 		}
 		w,h,e:=term.GetSize(int(os.Stdout.Fd()))
 		if e!=nil || w!=width || h!=height { return errors.New("terminal resized; restart watch") }

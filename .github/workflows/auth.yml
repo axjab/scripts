@@ -1,0 +1,28 @@
+name: Auth Go checks
+on:
+  pull_request:
+    paths:
+      - 'cmd/auth/**'
+      - 'do/build-auth'
+      - 'bin/auth.py'
+      - 'tests/test_auth.py'
+      - '.github/workflows/auth.yml'
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cmd/auth
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: false
+      - run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev pkg-config
+      - run: go test -mod=mod ./...
+      - run: go vet -mod=mod ./...
+      - run: go build -mod=mod .
+      - run: python3 -m unittest discover -s ../../tests -p test_auth.py -v

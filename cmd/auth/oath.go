@@ -112,7 +112,8 @@ type cardSession struct { card transmitter }
 func (s cardSession) exchange(ins, p1, p2 byte, data []byte, continuation byte) ([]byte, error) {
 	if len(data) > 255 { return nil, errors.New("card command too long") }
 	cmd := []byte{0, ins, p1, p2}
-	if len(data) > 0 { cmd = append(append(cmd, byte(len(data))), data...) }
+	// Short APDUs require an explicit zero length even when data is empty.
+	cmd = append(append(cmd, byte(len(data))), data...)
 	var all []byte
 	for i := 0; i < 256; i++ {
 		raw, err := s.card.Transmit(cmd)
@@ -122,8 +123,7 @@ func (s cardSession) exchange(ins, p1, p2 byte, data []byte, continuation byte) 
 		all = append(all, raw[:len(raw)-2]...)
 		if sw1 == 0x90 && sw2 == 0 { return all, nil }
 		if sw1 == 0x61 {
-			cmd = []byte{0, continuation, 0, 0}
-			if continuation == 0xc0 { cmd = append(cmd, sw2) }
+			cmd = []byte{0, continuation, 0, 0, 0}
 			continue
 		}
 		return nil, fmt.Errorf("card rejected command (status %02x%02x)", sw1, sw2)
