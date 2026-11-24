@@ -1,0 +1,176 @@
+#!/bin/sh
+
+# PAM insertion gate and display-only failure notice.
+# Gate returns 0 to try FIDO; otherwise PAM skips FIDO and uses password.
+# The 'wrong' mode must be configured [default=ignore] in PAM.
+# Yubico USB presence is not proof of an enrolled credential.
+
+POLL_INTERVAL=0.25
+YUBICO_VENDOR=1050
+ICON='󰷖 '
+TERMINAL_OPEN=0
+TTY_MODE_ACTIVE=0
+INTERRUPT_CHAR=$(printf '\003')
+
+check_timeout() {
+    case $TIMEOUT in
+        [1-9]|[12][0-9]|30) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+check_dependencies() {
+    [ -x /usr/bin/lsusb ] && [ -x /usr/bin/sleep ] &&
+        [ -x /usr/bin/stty ] && [ -x /usr/bin/dd ]
+}
+
+select_terminal() {
+    terminal=${PAM_TTY:-}
+    case $terminal in
+        /dev/tty[0-9]*|/dev/pts/[0-9]*) ;;
+        *) return 1 ;;
+    esac
+    case $terminal in
+        *[!0-9]) return 1 ;;
+    esac
+    [ -c "$terminal" ] && [ -w "$terminal" ] || return 1
+    exec 3>"$terminal" || return 1
+    TERMINAL_OPEN=1
+}
+
+key_is_inserted() {
+    /usr/bin/lsusb -d "${YUBICO_VENDOR}:" >/dev/null 2>&1
+}
+
+clear_prompt() {
+    printf '\r\033[2K' >&3
+}
+
+show_prompt() {
+    clear_prompt
+    printf '\033[38;2;250;204;21m%s\033[0m \033[38;2;254;240;138m%s\033[0m' "$ICON" "$1" >&3
+}
+
+show_countdown() {
+    show_prompt 'KEY REQUIRED'
+    printf ' \033[38;2;148;163;184m[%ss]\033[0m' "$1" >&3
+}
+
+show_wrong_key() {
+    clear_prompt
+    printf '\033[38;2;239;68;68m%s WRONG KEY\033[0m\n' "$ICON" >&3
+}
+
+show_skipped() {
+    show_prompt 'Key skipped'
+    printf '\n' >&3
+}
+
+restore_terminal() {
+    if [ "$TTY_MODE_ACTIVE" -eq 1 ]; then
+        /usr/bin/stty "$original_tty_mode" <&4 2>/dev/null || :
+        TTY_MODE_ACTIVE=0
+    fi
+}
+
+on_interrupt() {
+    trap - INT TERM HUP
+    restore_terminal
+    if [ "$TERMINAL_OPEN" -eq 1 ]; then
+        show_skipped
+    fi
+    exit 130
+}
+
+begin_interrupt_capture() {
+    # PAM children may inherit SIGINT ignored from sudo. In that case,
+    # trap INT never runs. Read the Ctrl+C byte from the tty instead.
+    exec 4<"$terminal" || return 1
+    original_tty_mode=$(/usr/bin/stty -g <&4 2>/dev/null) || return 1
+    [ -n "$original_tty_mode" ] || return 1
+    /usr/bin/stty -isig -icanon -echo min 0 time 0 <&4 2>/dev/null || return 1
+    TTY_MODE_ACTIVE=1
+    trap 'restore_terminal' 0
+}
+
+ctrl_c_pressed() {
+    # Noncanonical, nonblocking read: Ctrl+C is byte 0x03 rather than
+    # a signal. All other input is ignored during the insertion wait.
+    pressed=$(/usr/bin/dd bs=1 count=1 status=none <&4 2>/dev/null) || return 1
+    [ "$pressed" = "$INTERRUPT_CHAR" ]
+}
+
+wait_for_key() {
+    ticks=$((TIMEOUT * 4))
+    show_countdown "$TIMEOUT"
+    begin_interrupt_capture || return 1
+
+    while [ "$ticks" -gt 0 ]; do
+        if ctrl_c_pressed; then
+            restore_terminal
+            return 130
+        fi
+        /usr/bin/sleep "$POLL_INTERVAL" || return 1
+        if ctrl_c_pressed; then
+            restore_terminal
+            return 130
+        fi
+        if key_is_inserted; then
+            restore_terminal
+            return 0
+        fi
+        ticks=$((ticks - 1))
+        if [ "$ticks" -gt 0 ] && [ $((ticks % 4)) -eq 0 ]; then
+            show_countdown "$((ticks / 4))"
+        fi
+    done
+    restore_terminal
+    return 1
+}
+
+gate() {
+    check_timeout || return 1
+    check_dependencies || return 1
+    select_terminal || return 1
+    trap 'on_interrupt' INT TERM HUP
+
+    if key_is_inserted; then
+        show_prompt 'TOUCH THE KEY'
+        return 0
+    fi
+
+    wait_for_key
+    result=$?
+    if [ "$result" -eq 0 ]; then
+        show_prompt 'TOUCH THE KEY'
+        return 0
+    fi
+    if [ "$result" -eq 130 ]; then
+        show_skipped
+        return 130
+    fi
+    clear_prompt
+    return "$result"
+}
+
+wrong_key_notice() {
+    if select_terminal; then
+        show_wrong_key
+    fi
+    return 0
+}
+
+main() {
+    case ${1:-} in
+        wrong)
+            wrong_key_notice
+            ;;
+        *)
+            TIMEOUT=${1:-3}
+            gate
+            ;;
+    esac
+}
+
+main "$@"
+exit $?

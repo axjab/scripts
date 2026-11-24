@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Read-only MPEG diagnostics and recovery-oriented MP4 conversion.
+set -uo pipefail
+
+usage() {
+    printf 'Usage: %s {test|convert} FILE.mpg [FILE.mpg ...]\n' "${0##*/}" >&2
+}
+
+if (( $# < 2 )); then usage; exit 2; fi
+mode=$1
+shift
+case "$mode" in test|convert) ;; *) usage; exit 2 ;; esac
+
+for cmd in ffmpeg ffprobe; do
+    command -v "$cmd" >/dev/null || { printf 'Missing dependency: %s\n' "$cmd" >&2; exit 2; }
+done
+
+test_video() {
+    local src=$1
+    ffprobe -hide_banner "$src" || return 1
+    printf '\nDecoding entire source (read-only)...\n'
+    # Report failure if FFmpeg exits unsuccessfully OR prints decoding errors.
+    if ffmpeg -nostdin -hide_banner -v error -i "$src" \
+        -map 0:v:0 -map '0:a?' -f null - 2>&1 |
+        awk '{ print; bad=1 } END { exit (bad ? 1 : 0) }'; then
+        printf 'PASS: no decoding errors reported.\n'
+    else
+        printf 'FAIL: source decoding errors or unreadable stream.\n' >&2
+        return 1
+    fi
+}
+
+convert_video() {
+    local src=$1 out tmp log
+    out="${src%.*}.mp4"
+    log="${out}.log"
+    if [[ -e "$out" || -L "$out" ]]; then
+        printf 'SKIP: output already exists: %s\n' "$out" >&2
+        return 1
+    fi
+
+    tmp=$(mktemp -- "${out}.partial.XXXXXX") || return 1
+    if ! printf '\n--- Converting %s ---\n' "$src" >> "$log"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+
+    if ! ffmpeg -nostdin -hide_banner -v warning -stats -y \
+        -fflags +genpts+discardcorrupt -err_detect ignore_err \
+        -i "$src" -map 0:v:0 -map '0:a?' \
+        -c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p \
+        -c:a aac -b:a 160k -movflags +faststart \
+        -f mp4 "$tmp" 2>&1 | tee -a "$log"; then
+        printf 'FAIL: conversion failed. Partial output: %s\n' "$tmp" >&2
+        return 1
+    fi
+
+    printf '\nVerifying reconstructed MP4...\n'
+    # Require a video track and a full error-free decode before publishing.
+    local video
+    video=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_name -of csv=p=0 "$tmp" 2>>"$log") || return 1
+    if [[ -z "$video" ]] || ! ffmpeg -nostdin -hide_banner -v error -xerror \
+        -i "$tmp" -map 0:v:0 -map '0:a?' -f null - 2>&1 | tee -a "$log"; then
+        printf 'FAIL: MP4 verification failed. Partial output: %s\n' "$tmp" >&2
+        return 1
+    fi
+
+    # Publish atomically without overwriting any existing destination.
+    if ! ln -- "$tmp" "$out"; then
+        printf 'FAIL: could not publish output. Retained: %s\n' "$tmp" >&2
+        return 1
+    fi
+    rm -f -- "$tmp" || return 1
+    printf 'PASS: %s\nLog: %s\n' "$out" "$log"
+    ffprobe -v error -show_entries format=duration \
+        -of default=noprint_wrappers=1 "$out"
+}
+
+failed=0
+for src in "$@"; do
+    # Prevent filenames beginning with '-' from being parsed as options.
+    [[ "$src" = /* ]] || src="./$src"
+    printf '\n=== %s ===\n' "$src"
+    if [[ ! -f "$src" || ! -r "$src" ]]; then
+        printf 'FAIL: not a readable regular file.\n' >&2
+        failed=1
+        continue
+    fi
+    case "${src,,}" in
+        *.mpg|*.mpeg|*.mp4) ;;
+        *) printf 'FAIL: expected an MPG, MPEG or MP4 file.\n' >&2; failed=1; continue ;;
+    esac
+    if [[ "$mode" = test ]]; then
+        test_video "$src" || failed=1
+    else
+        case "${src,,}" in
+            *.mpg|*.mpeg) convert_video "$src" || failed=1 ;;
+            *) printf 'FAIL: conversion expects MPG or MPEG input.\n' >&2; failed=1 ;;
+        esac
+    fi
+done
+exit "$failed"
