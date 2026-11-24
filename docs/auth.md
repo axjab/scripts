@@ -1,87 +1,128 @@
 # auth
 
-A local YubiKey authenticator for Debian 13 / compatible Ubuntu. No daemon,
-root, configuration file or persistent secret cache. Requires system Python 3,
-`ykman` and its matching Python SDK (ykman/yubikit, normally installed together
-by the distribution). The executable uses /usr/bin/python3 to find system packages.
+Go implementation of the local YubiKey authenticator for Debian 13 / compatible
+Linux. The previous Python implementation is preserved verbatim as
+`bin/auth.py` (and its tests are retained). The Go executable does not call it
+or import the Yubico Python SDK. It uses native PC/SC for OATH and the existing
+`ykman` CLI for read-only device, FIDO and OpenPGP information.
 
-## Install
+## Build and install
 
-From the repository root, run `sudo apt install yubikey-manager` (installs
-host packages), then `install -Dm755 bin/auth ~/.local/bin/auth` (copies one
-executable). Ensure ~/.local/bin is on PATH. Uninstall with
-`rm ~/.local/bin/auth`. No YubiKey changes occur during installation.
+From the repository root:
+
+~~~sh
+sudo apt install golang-go build-essential pkg-config libpcsclite-dev pcscd yubikey-manager
+./do/build-auth
+install -Dm755 bin/auth ~/.local/bin/auth
+~~~
+
+The build installs no packages itself; the first command changes host packages,
+not the YubiKey. The Go module lives in cmd/auth, and its dependencies are
+version-pinned. The build uses CGO and links the system PC/SC library; it is not
+a fully static binary. Target systems need PC/SC runtime, CCID access and ykman.
+Cross-compile for the target OS/architecture with a suitable C toolchain.
+The generated binary is intentionally not committed. Remove
+`~/.local/bin/auth` to uninstall.
 
 ## Commands
 
-| Invocation | Effect |
+| Command | Behavior |
 | --- | --- |
-| auth | Watch TOTP codes until interrupted; non-TTY prints one snapshot |
-| auth QUERY | Select one unique substring match; explicit touch account gives one code |
-| auth list / ls | Read visible OATH account names and types |
-| auth add [issuer:name] | Persistent enrollment, default no touch, six digits, SHA1, 30s |
-| auth rename QUERY NAME | Persistent rename, preserves issuer unless specified |
-| auth rm QUERY / remove QUERY | Irreversible deletion, default No |
-| auth fido | Native discoverable credential list, secure backend PIN prompt |
-| auth pgp | Read native OpenPGP info and available slot metadata |
-| auth doctor | Read-only policy matrix for each connected serial-numbered USB key |
-| auth help / --help / --version | Help/version |
+| auth | Watch TOTP, one global countdown, no terminal clear |
+| auth QUERY | One matching TOTP snapshot; explicit touch for a touch credential |
+| auth list / ls | OATH names/types, no code generation |
+| auth add [issuer:name] | Persistent enrollment; no touch, SHA1/6 digits/30s defaults |
+| auth rename QUERY NAME | Persistent exact-ID rename, retains issuer/period |
+| auth rm QUERY / remove QUERY | Irreversible deletion, confirmation defaults to No |
+| auth fido | Native discoverable FIDO2 inventory; PIN prompt |
+| auth pgp | Native general and slot metadata |
+| auth doctor | Read-only device/clock/application policy report |
+| auth --help / help / --version | Help and version |
 
-Global --device SERIAL selects one detected key. More than one key requires
-selection for all commands except doctor. Add accepts --algorithm, --digits,
---period, --oath-type and --counter. Writes require a terminal and confirmation.
-No secret or PIN in argv. OATH password is prompted once per session and not
-cached by the wrapper. HOTP is deliberately not generated, even for a query;
-use raw ykman deliberately if needed. Hidden accounts are omitted from views.
+Use options before the command, e.g. `auth --device SERIAL list` or
+`auth --digits 8 add Example`. Enrollment also accepts --algorithm,
+--period, --oath-type and --counter. Multiple keys require explicit serial
+selection except doctor; the card's serial is verified on the same connection
+before OATH access. Doctor inspects all detected serial-numbered keys.
 
-Exit codes: 0 success, 1 doctor policy mismatch, 2 dependency/usage/backend
-failure or unverified device policy, 130 interrupt (SIGINT or SIGTERM).
-Unknown clock status alone is informational; a negative clock sync report is
-a mismatch. Clock sync does not establish actual clock accuracy.
+Illustrative output (fictional):
 
-## Implementation choices and limitations
+~~~text
+ACCOUNT                          CODE
+Example                          012345
+Other                            573891
+Expires in 18s
+~~~
 
-- Uses the official Yubico Python SDK for OATH, rather than the CLI code command.
-  In upstream 5.6.1, that command automatically calculates a lone matching HOTP
-  and can delete a corrupted credential on memory failure. The SDK calculate_all
-  explicitly excludes HOTP and touch, does not invoke CLI repair, and provides
-  actual validity intervals. SDK exact byte IDs also avoid fuzzy write races.
-  The upstream 5.6.1 source was inspected; installed backend help and actual
-  Debian/Ubuntu compatibility still require validation.
-- The 5.6.1 CLI add prompt does not hide the entered Base32 secret. The wrapper
-  therefore uses getpass and the SDK instead; no touch enrollment or forced
-  overwrite. No cryptographic algorithms are reimplemented.
-- FIDO uses the native table rather than CSV parsing to preserve the backend
-  prompt. Wrong PIN can reduce retries; no automatic retry. Discoverable
-  credentials are not a complete registration inventory.
-- OpenPGP prints backend metadata; unknown/inaccessible slots remain unknown.
-  Doctor does not authenticate, install, repair, or change any setting.
-- Live view updates only its own lines; terminal size/account count changes
-  stop the view rather than risk overwriting shell history. Disconnect is
-  detected on the next hardware refresh, then the command exits; rerun after
-  reconnecting. Accounts requiring touch are not polled automatically.
-  Touch-required Steam accounts are not supported.
-- No live hardware, installed ykman, or runtime dependency verification was
-  available during authoring. This is a review candidate, not production-ready.
+All standard 30-second TOTP accounts share the Unix-time boundary. For
+nonstandard periods, the same single countdown reports the next expiration,
+and nonstandard entries are labeled with their period. Non-TTY stdout prints
+one snapshot and exits. HOTP is never calculated by this tool. Steam-format
+credentials are not supported in the native Go backend; the preserved Python
+implementation or Yubico Authenticator can be used deliberately. Explicit
+query is a one-shot in this draft. Resize, disconnect, or hardware error
+requires restarting watch.
 
-## Verify
+## Code map for a Go beginner
 
-Run `python3 -m unittest discover -s tests -p test_auth.py -v`.
-Fixtures contain invented names and codes; tests never use hardware.
+- main.go: argument parsing, cancellation, command routing, secure prompts,
+  account matching, confirmation and watch rendering.
+- oath.go: PC/SC transport, serial verification, OATH protocol request/response
+  parsing, list/calculation/CRUD and password challenge-response. Comments
+  explain interfaces, error handling, and the reasons behind safety checks.
+- doctor.go: policy comparison and native OpenPGP/FIDO-related diagnostics.
+- auth_test.go: hardware-free tests using a fake card and pure functions.
+- go.mod: pinned build dependencies.
 
-Optional hardware checks, separately for each key:
-1. `ykman --version`, `ykman oath accounts list --help`, `ykman oath accounts
-   code --help`, `ykman openpgp keys info --help`, `auth doctor`.
-2. Compare `auth list` with native list; watch across a real period boundary,
-   Ctrl+C, resize, disconnect, multiple devices and redirected output. Test
-   HOTP-only and touch-only cases without advancing HOTP.
-3. Run `auth fido` with the correct PIN (wrong PIN reduces retry counter);
-   compare `auth pgp` against native slot metadata.
-4. Only with a disposable test secret and explicit permission: add an account
-   (persistent; remove to undo), rename it (persistent; rename back to undo),
-   then remove it (irreversible without the original secret). Verify by listing
-   after each operation. Do not test on production credentials.
+## Safety and limitations
 
-References: [Yubico CLI guide](https://docs.yubico.com/software/yubikey/tools/ykman/),
-[OATH CLI 5.6.1 source](https://github.com/Yubico/yubikey-manager/blob/5.6.1/ykman/_cli/oath.py),
-[OATH SDK 5.6.1 source](https://github.com/Yubico/yubikey-manager/blob/5.6.1/yubikit/oath.py).
+No OTP, password or Base32 secret is stored on disk, passed as a process
+argument or sent to a logging system. The YubiKey performs OTP calculations.
+The OATH protocol uses native PC/SC with standard Go crypto libraries for the
+documented authentication handshake; no FIDO/OpenPGP algorithms are implemented.
+The upstream ykman accounts code command can advance HOTP when a single
+account matches and can attempt automatic repair/deletion on corruption.
+We never call that command. The card transport uses exact IDs and an exclusive
+PC/SC transaction to prevent interleaving with other clients between check and
+write. Watch holds that transaction until exit, so other CCID consumers may
+wait; stop watch before using those consumers. No driver or daemon is
+automatically modified or restarted. SIGINT/SIGTERM cancels watch, but a native
+in-flight card operation may complete first. Read-only FIDO inventory may
+consume a PIN attempt on incorrect PIN; never automatically retries.
+
+Exit 0 success, 1 verified doctor policy mismatch, 2 usage/backend failure or
+unverifiable policy, 130 interrupt. Clock unknown is informational.
+
+## Tests and review
+
+~~~sh
+cd cmd/auth
+go mod tidy
+gofmt -w *.go
+go test ./...
+go vet ./...
+~~~
+
+Run original Python tests from the repo root:
+`python3 -m unittest discover -s tests -p test_auth.py -v`.
+
+No attached physical key or installed ykman is available during authoring.
+Dependency resolution, Go compilation, tests, and actual card protocol behavior
+remain unverified until run on an appropriate host. Do not merge as production
+ready before those gates pass. Review native PC/SC code against Yubico's
+protocol and test hardware with expendable credentials first. Test each key
+independently.
+
+1. Read-only: verify ykman version/help, auth doctor, auth list, multi-key
+   selection, FIDO inventory, OpenPGP slots, 30-second and custom TOTP
+   boundaries, watch resize/interrupt, non-TTY snapshot, disconnection,
+   protected OATH, HOTP-only and touch-only cases. No HOTP calculation.
+2. With explicit permission and a disposable secret: add (persistent;
+   removable), rename (persistent; rename back), remove (irreversible without
+   original secret). Verify by listing after every operation.
+3. Never use production credentials for write testing.
+
+References: [Yubico OATH protocol](https://developers.yubico.com/OATH/YKOATH_Protocol.html),
+[Yubico SDK source](https://github.com/Yubico/yubikey-manager/blob/5.6.1/yubikit/oath.py),
+[management SDK](https://github.com/Yubico/yubikey-manager/blob/5.6.1/yubikit/management.py),
+[ykman guide](https://docs.yubico.com/software/yubikey/tools/ykman/).

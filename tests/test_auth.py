@@ -7,7 +7,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-auth = types.SimpleNamespace(**runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / "bin/auth")))
+auth = types.SimpleNamespace(**runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / "bin/auth.py")))
 G = auth.main.__globals__
 
 
