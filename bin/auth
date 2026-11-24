@@ -232,10 +232,10 @@ def watch(session, query):
                 raise AuthError("Selected credential changed")
             cred = matches[0]
             print("Touch your YubiKey (one code only).", file=sys.stderr)
-            code = session.calculate_code(cred)
-            value = code.value
             if cred.issuer == "Steam":
                 raise AuthError("Touch-required Steam credentials are not supported")
+            code = session.calculate_code(cred)
+            value = code.value
             rows = [(account_id(cred), value, code.valid_from, code.valid_to)]
             live = False
         if not live:
@@ -245,11 +245,15 @@ def watch(session, query):
             return
         while True:
             now = time.time()
+            if (shutil.get_terminal_size() != dimensions
+                    or len(render(rows, now)) >= dimensions.lines):
+                print("Watch stopped: terminal size or account count changed.")
+                return
             if needs_refresh(rows, now):
                 # Invalidate old codes on screen before potentially slow I/O.
                 expired = render(rows, now)
-                draw(expired, old_count, dimensions.columns)
-                old_count = len(expired)
+                if old_count:
+                    draw(expired, old_count, dimensions.columns)
                 rows = fetch_codes(session, int(time.time()), target)
                 now = time.time()
             lines = render(rows, now)
@@ -334,6 +338,8 @@ def write_oath(session, serial, command, args, options):
     cred = resolve(accounts, args[0])
     if command == "rename":
         issuer, name = name_parts(args[1], cred.issuer)
+        if is_hotp(cred):
+            raise AuthError("HOTP rename not supported: SDK rename assumes TOTP identity format")
         if session.version < (5, 3, 1):
             raise AuthError("Rename requires firmware 5.3.1 or later")
         data = CredentialData(name, cred.oath_type, HASH_ALGORITHM.SHA1,
